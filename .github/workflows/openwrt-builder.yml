@@ -31,7 +31,7 @@ jobs:
         echo "Labels: ${{ runner.labels }}"
         df -h
         free -h
-        # 空间不足直接失败 (20 GB threshold)
+        # 空间不足直接失败（20G阈值）
         FREE=$(df -k --output=avail / | tail -1)
         if [ "$FREE" -lt 20971520 ]; then
           echo "❌ Not enough disk space"; exit 1; fi
@@ -101,4 +101,75 @@ jobs:
       if: (!cancelled())
       run: df -hT
 
-    - name: Upload bin direct
+    - name: Upload bin directory
+      uses: actions/upload-artifact@v4
+      if: steps.compile.outputs.status == 'success' && env.UPLOAD_BIN_DIR == 'true'
+      with:
+        name: OpenWrt_bin${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
+        path: openwrt/bin
+
+    # ✅ 稳定定位固件目录并写 FIRMWARE（修复 Organize files 失败）
+    - name: Locate firmware directory
+      id: organize
+      if: env.UPLOAD_FIRMWARE == 'true' && !cancelled()
+      shell: bash
+      run: |
+        set -euo pipefail
+        shopt -s nullglob
+        base="$GITHUB_WORKSPACE/openwrt/bin/targets"
+        arr=("$base"/*/*)
+        if [[ ${#arr[@]} -eq 0 ]]; then
+          echo "❌ No firmware directory under $base" >&2
+          find "$GITHUB_WORKSPACE/openwrt" -maxdepth 5 -type f \( -name '*.bin' -o -name '*.img.gz' -o -name '*.tar' \) | head -n 50
+          exit 1
+        fi
+        FIRMWARE="${arr[0]}"
+        echo "FIRMWARE=$FIRMWARE" >> "$GITHUB_ENV"
+        echo "Firmware dir: $FIRMWARE"
+        ls -lh "$FIRMWARE"
+        echo "status=success" >> "$GITHUB_OUTPUT"
+
+    - name: Upload firmware directory
+      uses: actions/upload-artifact@v4
+      if: steps.organize.outputs.status == 'success' && !cancelled()
+      with:
+        name: OpenWrt_firmware${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
+        path: ${{ env.FIRMWARE }}
+
+    - name: Generate release tag
+      id: tag
+      if: env.UPLOAD_RELEASE == 'true' && !cancelled()
+      run: |
+        echo "release_tag=$(date +"%Y.%m.%d-%H%M")" >> "$GITHUB_OUTPUT"
+        echo "OpenWrt auto build" > release.txt
+        echo "status=success" >> "$GITHUB_OUTPUT"
+
+    # ✅ 仅上传固件后缀，避免误扫到 /swapfile
+    - name: Upload firmware to release
+      uses: softprops/action-gh-release@v2
+      if: steps.tag.outputs.status == 'success' && !cancelled()
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ steps.tag.outputs.release_tag }}
+        body_path: release.txt
+        files: |
+          ${{ env.FIRMWARE }}/*.bin
+          ${{ env.FIRMWARE }}/*.img.gz
+          ${{ env.FIRMWARE }}/*.tar
+          ${{ env.FIRMWARE }}/*.manifest
+
+    - name: Delete workflow runs
+      uses: Mattraks/delete-workflow-runs@v2
+      with:
+        retain_days: 0
+        keep_minimum_runs: 2
+
+    - name: Remove old Releases
+      uses: dev-drprasad/delete-older-releases@v0.3.2
+      if: env.UPLOAD_RELEASE == 'true' && !cancelled()
+      with:
+        keep_latest: 3
+        delete_tags: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
