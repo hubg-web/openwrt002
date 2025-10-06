@@ -24,22 +24,26 @@ jobs:
     - name: Checkout
       uses: actions/checkout@v4
 
-    # 自托管信息与空间检查（无 sudo）
+    # Self-hosted info & disk guard (no sudo)
     - name: Show runner env & disk
+      shell: bash
       run: |
         echo "Runner: ${{ runner.name }}"
         echo "Labels: ${{ runner.labels }}"
         df -h
         free -h
-        # 空间不足直接失败（20G阈值）
+        # fail fast if free space < 20 GB
         FREE=$(df -k --output=avail / | tail -1)
         if [ "$FREE" -lt 20971520 ]; then
-          echo "❌ Not enough disk space"; exit 1; fi
+          echo "Not enough disk space"; exit 1; fi
+        # timezone
+        date
 
-    #（可选）托管机初始化：仅在非自托管时执行。你是自托管，这步会自动跳过
+    # Hosted-only init (skipped on self-hosted)
     - name: Initialization for hosted runner (skipped on self-hosted)
       if: ${{ !contains(runner.labels, 'self-hosted') }}
-      env: { DEBIAN_FRONTEND: noninteractive }
+      env:
+        DEBIAN_FRONTEND: noninteractive
       run: |
         sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
         sudo docker image prune --all --force
@@ -49,13 +53,27 @@ jobs:
         sudo -E apt-get -qq clean
         sudo timedatectl set-timezone "$TZ"
 
-    # 自托管：不使用 /workdir、不用 sudo；直接在工作区操作
     - name: Clone source code
+      shell: bash
       run: |
         git clone "$REPO_URL" -b "$REPO_BRANCH" openwrt
         ls -la
 
+    # Persist caches: ccache and dl
+    - name: Prepare caches (ccache & dl)
+      shell: bash
+      run: |
+        mkdir -p /home/runner/.ccache
+        echo "CCACHE_DIR=/home/runner/.ccache" >> "$GITHUB_ENV"
+        echo "CCACHE_MAXSIZE=5G" >> "$GITHUB_ENV"
+        # persist dl
+        mkdir -p /home/runner/.openwrt-cache/dl
+        if [ ! -e "$GITHUB_WORKSPACE/openwrt/dl" ]; then
+          ln -s /home/runner/.openwrt-cache/dl "$GITHUB_WORKSPACE/openwrt/dl"
+        fi
+
     - name: Load custom feeds
+      shell: bash
       run: |
         [ -e "$FEEDS_CONF" ] && mv "$FEEDS_CONF" openwrt/feeds.conf.default
         chmod +x "$DIY_P1_SH"
@@ -69,6 +87,7 @@ jobs:
       run: cd openwrt && ./scripts/feeds install -a
 
     - name: Load custom configuration
+      shell: bash
       run: |
         [ -e files ] && mv files openwrt/files
         [ -e "$CONFIG_FILE" ] && mv "$CONFIG_FILE" openwrt/.config
@@ -77,6 +96,7 @@ jobs:
         "$GITHUB_WORKSPACE/$DIY_P2_SH"
 
     - name: Download package
+      shell: bash
       run: |
         cd openwrt
         make defconfig
@@ -86,13 +106,17 @@ jobs:
     - name: Compile the firmware
       id: compile
       shell: bash
+      env:
+        CCACHE_DIR: ${{ env.CCACHE_DIR }}
+        CCACHE_MAXSIZE: ${{ env.CCACHE_MAXSIZE }}
       run: |
         set -e
         cd openwrt
-        echo -e "$(nproc) thread compile"
+        echo "$(nproc) thread compile"
+        # enable ccache if available
+        grep -q '^CONFIG_CCACHE=y' .config || sed -i '/^# CONFIG_CCACHE is not set$/c\CONFIG_CCACHE=y' .config || true
         /usr/bin/time -v make -j"$(nproc)" || { echo "fallback to -j1"; make -j1 V=s; }
         echo "status=success" >> "$GITHUB_OUTPUT"
-        # 设备名与时间
         grep '^CONFIG_TARGET.*DEVICE_.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/' > DEVICE_NAME || true
         [ -s DEVICE_NAME ] && echo "DEVICE_NAME=_$(cat DEVICE_NAME)" >> "$GITHUB_ENV"
         echo "FILE_DATE=_$(date +"%Y%m%d%H%M")" >> "$GITHUB_ENV"
@@ -108,7 +132,7 @@ jobs:
         name: OpenWrt_bin${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
         path: openwrt/bin
 
-    # ✅ 稳定定位固件目录并写 FIRMWARE（修复 Organize files 失败）
+    # robust firmware dir detection
     - name: Locate firmware directory
       id: organize
       if: env.UPLOAD_FIRMWARE == 'true' && !cancelled()
@@ -116,11 +140,17 @@ jobs:
       run: |
         set -euo pipefail
         shopt -s nullglob
-        base="$GITHUB_WORKSPACE/openwrt/bin/targets"
+        if [ -d "$GITHUB_WORKSPACE/openwrt/bin/targets" ]; then
+          base="$GITHUB_WORKSPACE/openwrt/bin/targets"
+        elif [ -d "$PWD/openwrt/bin/targets" ]; then
+          base="$PWD/openwrt/bin/targets"
+        else
+          echo "No bin/targets directory"; find "$GITHUB_WORKSPACE" -maxdepth 5 -type d -name targets | head -n 10 || true; exit 1
+        fi
         arr=("$base"/*/*)
         if [[ ${#arr[@]} -eq 0 ]]; then
-          echo "❌ No firmware directory under $base" >&2
-          find "$GITHUB_WORKSPACE/openwrt" -maxdepth 5 -type f \( -name '*.bin' -o -name '*.img.gz' -o -name '*.tar' \) | head -n 50
+          echo "No firmware directory under $base"
+          find "$base" -maxdepth 5 -type f \( -name '*.bin' -o -name '*.img.gz' -o -name '*.tar' \) | head -n 50 || true
           exit 1
         fi
         FIRMWARE="${arr[0]}"
@@ -144,7 +174,7 @@ jobs:
         echo "OpenWrt auto build" > release.txt
         echo "status=success" >> "$GITHUB_OUTPUT"
 
-    # ✅ 仅上传固件后缀，避免误扫到 /swapfile
+    # upload only firmware file types to avoid /swapfile issue
     - name: Upload firmware to release
       uses: softprops/action-gh-release@v2
       if: steps.tag.outputs.status == 'success' && !cancelled()
