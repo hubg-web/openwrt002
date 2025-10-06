@@ -26,15 +26,9 @@ jobs:
 
     # hosted 才执行的初始化（自托管自动跳过，避免 sudo 报错）
     - name: Initialization environment
-      if: ${{ !contains(runner.labels, 'self-hosted') }}
-      env:
-        DEBIAN_FRONTEND: noninteractive
-      run: |
-        sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-        sudo docker image prune --all --force
-        sudo -E apt-get -qq update
-        sudo -E apt-get -qq install ...
-        sudo -E apt-get -qq clean
+      if: ${{ false }}
+      run: echo "skip on self-hosted"
+
 
 
     - name: Clone source code
