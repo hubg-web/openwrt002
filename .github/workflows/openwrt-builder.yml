@@ -57,6 +57,23 @@ jobs:
         chmod +x $DIY_P2_SH
         cd openwrt
         $GITHUB_WORKSPACE/$DIY_P2_SH
+    # 二选一：只保留其中一个 step
+
+    # A) 取消 strace
+    - name: Disable strace (workaround build failure)
+      run: |
+        cd openwrt
+        ./scripts/config -d PACKAGE_strace || true
+        sed -i '/^CONFIG_PACKAGE_strace[=m|=y]/d' .config
+        echo '# CONFIG_PACKAGE_strace is not set' >> .config
+        make defconfig
+
+    # B) 使用 bundled 头
+    # - name: Force strace to use bundled UAPI headers
+    #   run: |
+    #     cd openwrt
+    #     sed -i 's/^\(CONFIGURE_ARGS *=.*\)$/\1 --enable-bundled/' package/devel/strace/Makefile
+    #     make package/strace/clean
 
     - name: Download package
       id: package
