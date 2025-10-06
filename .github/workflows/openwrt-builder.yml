@@ -31,7 +31,7 @@ jobs:
         echo "Labels: ${{ runner.labels }}"
         df -h
         free -h
-        # 空间不足直接失败20G阈值
+        # 空间不足直接失败 (20 GB threshold)
         FREE=$(df -k --output=avail / | tail -1)
         if [ "$FREE" -lt 20971520 ]; then
           echo "❌ Not enough disk space"; exit 1; fi
