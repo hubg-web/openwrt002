@@ -21,164 +21,182 @@ jobs:
     runs-on: [self-hosted, Linux, X64]
 
     steps:
-    - name: Checkout
-      uses: actions/checkout@main
+      - name: Checkout
+        uses: actions/checkout@main
 
-    # hosted 才执行的初始化（自托管自动跳过，避免 sudo 报错）
-    - name: Initialization environment
-      if: ${{ false }}
-      run: echo "skip on self-hosted"
+      # hosted 才执行的初始化（自托管自动跳过，避免 sudo 报错）
+      - name: Initialization environment
+        if: ${{ false }}
+        run: echo "skip on self-hosted"
 
+      - name: Clone source code
+        run: |
+          df -hT $PWD
+          git clone $REPO_URL -b $REPO_BRANCH openwrt
+          ln -sf $GITHUB_WORKSPACE/openwrt openwrt
 
+      - name: Load custom feeds
+        run: |
+          [ -e $FEEDS_CONF ] && mv $FEEDS_CONF openwrt/feeds.conf.default
+          chmod +x $DIY_P1_SH
+          cd openwrt
+          $GITHUB_WORKSPACE/$DIY_P1_SH
 
-    - name: Clone source code
-      run: |
-        df -hT $PWD
-        git clone $REPO_URL -b $REPO_BRANCH openwrt
-        ln -sf $GITHUB_WORKSPACE/openwrt openwrt
+      - name: Update feeds
+        run: cd openwrt && ./scripts/feeds update -a
 
-    - name: Load custom feeds
-      run: |
-        [ -e $FEEDS_CONF ] && mv $FEEDS_CONF openwrt/feeds.conf.default
-        chmod +x $DIY_P1_SH
-        cd openwrt
-        $GITHUB_WORKSPACE/$DIY_P1_SH
+      - name: Install feeds
+        run: cd openwrt && ./scripts/feeds install -a
 
-    - name: Update feeds
-      run: cd openwrt && ./scripts/feeds update -a
+      - name: Load custom configuration
+        run: |
+          [ -e files ] && mv files openwrt/files
+          [ -e $CONFIG_FILE ] && mv $CONFIG_FILE openwrt/.config
+          chmod +x $DIY_P2_SH
+          cd openwrt
+          $GITHUB_WORKSPACE/$DIY_P2_SH
 
-    - name: Install feeds
-      run: cd openwrt && ./scripts/feeds install -a
+      # 关闭已知易失败的包（amule + strace），并让变更生效
+      - name: Disable problematic packages (amule, strace)
+        shell: bash
+        run: |
+          cd openwrt
+          # 关掉 aMule 全家桶（存在什么就关什么）
+          for p in amule amuled amule-utils amule-utils-gui amule-webui; do
+            ./scripts/config -d "PACKAGE_${p}" || true
+            sed -i "/^CONFIG_PACKAGE_${p}[=m|=y]/d" .config || true
+          done
+          # 顺手关掉之前出问题的 strace
+          ./scripts/config -d PACKAGE_strace || true
+          sed -i '/^CONFIG_PACKAGE_strace[=m|=y]/d' .config || true
+          # 让变更生效
+          make defconfig
 
-    - name: Load custom configuration
-      run: |
-        [ -e files ] && mv files openwrt/files
-        [ -e $CONFIG_FILE ] && mv $CONFIG_FILE openwrt/.config
-        chmod +x $DIY_P2_SH
-        cd openwrt
-        $GITHUB_WORKSPACE/$DIY_P2_SH
-    # 二选一：只保留其中一个 step
+      - name: Build tools & toolchain (fail fast)
+        shell: bash
+        run: |
+          cd openwrt
+          make defconfig
+          make tools/install -j"$(nproc)" V=s
+          make toolchain/install -j"$(nproc)" V=s
 
-    # A) 取消 strace
-    - name: Disable strace (workaround build failure)
-      run: |
-        cd openwrt
-        ./scripts/config -d PACKAGE_strace || true
-        sed -i '/^CONFIG_PACKAGE_strace[=m|=y]/d' .config
-        echo '# CONFIG_PACKAGE_strace is not set' >> .config
-        make defconfig
+      - name: Early package probe (fast fail)
+        shell: bash
+        run: |
+          set -e
+          cd openwrt
+          # 只探测体量不大的用户态应用，避免拖长时间
+          CANDIDATES=$(grep -E '^CONFIG_PACKAGE_(amule|strace).+=(y|m)$' .config \
+            | sed -E 's/^CONFIG_PACKAGE_(.+)=(y|m)/\1/' || true)
+          for p in $CANDIDATES; do
+            echo ">>> probing package: $p"
+            make -j"$(nproc)" "package/$p/compile" V=s
+          done
 
-    # B) 使用 bundled 头
-    # - name: Force strace to use bundled UAPI headers
-    #   run: |
-    #     cd openwrt
-    #     sed -i 's/^\(CONFIGURE_ARGS *=.*\)$/\1 --enable-bundled/' package/devel/strace/Makefile
-    #     make package/strace/clean
+      - name: Download package
+        id: package
+        run: |
+          cd openwrt
+          make defconfig
+          make download -j8
+          find dl -size -1024c -exec ls -l {} \; | cat
+          find dl -size -1024c -exec rm -f {} \;
 
-    - name: Download package
-      id: package
-      run: |
-        cd openwrt
-        make defconfig
-        make download -j8
-        find dl -size -1024c -exec ls -l {} \; | cat
-        find dl -size -1024c -exec rm -f {} \;
+      - name: Compile the firmware
+        id: compile
+        run: |
+          set -e
+          cd openwrt
+          echo -e "$(nproc) thread compile"
+          if ! make -j"$(nproc)"; then
+            echo "parallel failed, fallback to -j1 V=s"
+            make -j1 V=s
+          fi
+          # 没有 targets 就视为失败
+          if [ ! -d "bin/targets" ]; then
+            echo "build finished but no bin/targets"; exit 1
+          fi
+          echo "status=success" >> $GITHUB_OUTPUT
+          grep '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/' > DEVICE_NAME || true
+          [ -s DEVICE_NAME ] && echo "DEVICE_NAME=_$(cat DEVICE_NAME)" >> $GITHUB_ENV
+          echo "FILE_DATE=_$(date +"%Y%m%d%H%M")" >> $GITHUB_ENV
 
-    - name: Compile the firmware
-      id: compile
-      run: |
-        set -e
-        cd openwrt
-        echo -e "$(nproc) thread compile"
-        if ! make -j"$(nproc)"; then
-          echo "parallel failed, fallback to -j1 V=s"
-          make -j1 V=s
-        fi
-        # 没有 targets 就视为失败
-        if [ ! -d "bin/targets" ]; then
-          echo "build finished but no bin/targets"; exit 1
-        fi
-        echo "status=success" >> $GITHUB_OUTPUT
-        grep '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/' > DEVICE_NAME || true
-        [ -s DEVICE_NAME ] && echo "DEVICE_NAME=_$(cat DEVICE_NAME)" >> $GITHUB_ENV
-        echo "FILE_DATE=_$(date +"%Y%m%d%H%M")" >> $GITHUB_ENV
+      - name: Check space usage
+        if: (!cancelled())
+        run: df -hT
 
-    - name: Check space usage
-      if: (!cancelled())
-      run: df -hT
+      - name: Upload bin directory
+        uses: actions/upload-artifact@main
+        if: steps.compile.outputs.status == 'success' && env.UPLOAD_BIN_DIR == 'true'
+        with:
+          name: OpenWrt_bin${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
+          path: openwrt/bin
 
-    - name: Upload bin directory
-      uses: actions/upload-artifact@main
-      if: steps.compile.outputs.status == 'success' && env.UPLOAD_BIN_DIR == 'true'
-      with:
-        name: OpenWrt_bin${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
-        path: openwrt/bin
+      # 仅在编译成功后定位固件目录；兼容自托管路径
+      - name: Locate firmware directory
+        id: organize
+        if: steps.compile.outputs.status == 'success' && env.UPLOAD_FIRMWARE == 'true' && !cancelled()
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          if [ -d "$GITHUB_WORKSPACE/openwrt/bin/targets" ]; then
+            base="$GITHUB_WORKSPACE/openwrt/bin/targets"
+          elif [ -d "$PWD/openwrt/bin/targets" ]; then
+            base="$PWD/openwrt/bin/targets"
+          else
+            echo "No bin/targets directory"; exit 1
+          fi
+          arr=("$base"/*/*)
+          if [[ ${#arr[@]} -eq 0 ]]; then
+            echo "No firmware subdir under $base"; exit 1
+          fi
+          FIRMWARE="${arr[0]}"
+          echo "FIRMWARE=$FIRMWARE" >> "$GITHUB_ENV"
+          echo "Firmware dir: $FIRMWARE"
+          ls -lh "$FIRMWARE"
+          echo "status=success" >> "$GITHUB_OUTPUT"
 
-    # 仅在编译成功后定位固件目录；兼容自托管路径
-    - name: Locate firmware directory
-      id: organize
-      if: steps.compile.outputs.status == 'success' && env.UPLOAD_FIRMWARE == 'true' && !cancelled()
-      shell: bash
-      run: |
-        set -euo pipefail
-        shopt -s nullglob
-        if [ -d "$GITHUB_WORKSPACE/openwrt/bin/targets" ]; then
-          base="$GITHUB_WORKSPACE/openwrt/bin/targets"
-        elif [ -d "$PWD/openwrt/bin/targets" ]; then
-          base="$PWD/openwrt/bin/targets"
-        else
-          echo "No bin/targets directory"; exit 1
-        fi
-        arr=("$base"/*/*)
-        if [[ ${#arr[@]} -eq 0 ]]; then
-          echo "No firmware subdir under $base"; exit 1
-        fi
-        FIRMWARE="${arr[0]}"
-        echo "FIRMWARE=$FIRMWARE" >> "$GITHUB_ENV"
-        echo "Firmware dir: $FIRMWARE"
-        ls -lh "$FIRMWARE"
-        echo "status=success" >> "$GITHUB_OUTPUT"
+      - name: Upload firmware directory
+        uses: actions/upload-artifact@main
+        if: steps.organize.outputs.status == 'success' && !cancelled()
+        with:
+          name: OpenWrt_firmware${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
+          path: ${{ env.FIRMWARE }}
 
-    - name: Upload firmware directory
-      uses: actions/upload-artifact@main
-      if: steps.organize.outputs.status == 'success' && !cancelled()
-      with:
-        name: OpenWrt_firmware${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
-        path: ${{ env.FIRMWARE }}
+      - name: Generate release tag
+        id: tag
+        if: env.UPLOAD_RELEASE == 'true' && steps.organize.outputs.status == 'success' && !cancelled()
+        run: |
+          echo "release_tag=$(date +"%Y.%m.%d-%H%M")" >> $GITHUB_OUTPUT
+          touch release.txt
+          echo "status=success" >> $GITHUB_OUTPUT
 
-    - name: Generate release tag
-      id: tag
-      if: env.UPLOAD_RELEASE == 'true' && steps.organize.outputs.status == 'success' && !cancelled()
-      run: |
-        echo "release_tag=$(date +"%Y.%m.%d-%H%M")" >> $GITHUB_OUTPUT
-        touch release.txt
-        echo "status=success" >> $GITHUB_OUTPUT
+      - name: Upload firmware to release
+        uses: softprops/action-gh-release@master
+        if: steps.tag.outputs.status == 'success' && steps.organize.outputs.status == 'success' && !cancelled()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ steps.tag.outputs.release_tag }}
+          body_path: release.txt
+          files: |
+            ${{ env.FIRMWARE }}/*.bin
+            ${{ env.FIRMWARE }}/*.img.gz
+            ${{ env.FIRMWARE }}/*.tar
+            ${{ env.FIRMWARE }}/*.manifest
 
-    - name: Upload firmware to release
-      uses: softprops/action-gh-release@master
-      if: steps.tag.outputs.status == 'success' && steps.organize.outputs.status == 'success' && !cancelled()
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        tag_name: ${{ steps.tag.outputs.release_tag }}
-        body_path: release.txt
-        files: |
-          ${{ env.FIRMWARE }}/*.bin
-          ${{ env.FIRMWARE }}/*.img.gz
-          ${{ env.FIRMWARE }}/*.tar
-          ${{ env.FIRMWARE }}/*.manifest
+      - name: Delete workflow runs
+        uses: Mattraks/delete-workflow-runs@main
+        with:
+          retain_days: 0
+          keep_minimum_runs: 2
 
-    - name: Delete workflow runs
-      uses: Mattraks/delete-workflow-runs@main
-      with:
-        retain_days: 0
-        keep_minimum_runs: 2
-
-    - name: Remove old Releases
-      uses: dev-drprasad/delete-older-releases@master
-      if: env.UPLOAD_RELEASE == 'true' && !cancelled()
-      with:
-        keep_latest: 3
-        delete_tags: true
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Remove old Releases
+        uses: dev-drprasad/delete-older-releases@master
+        if: env.UPLOAD_RELEASE == 'true' && !cancelled()
+        with:
+          keep_latest: 3
+          delete_tags: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
